@@ -313,7 +313,7 @@ wire clk_sys;   // 32 MHz video / download / loader / main-bus / sound domain
 // black-screened the board. The clk_t11 logic Fmax is 57.91 MHz, comfortably above 32 MHz. The old 20 MHz outclk_1
 // is left generated-but-unused.
 wire clk_t11 = clk_sys;
-wire clk_pll1_unused;
+wire clk_vid64;   // SCANDOUBLER PATCH: 64 MHz = 4x the 16 MHz pixel clock (sys/video_mixer needs ce_pix*4)
 wire pll_locked;
 
 pll pll
@@ -321,7 +321,7 @@ pll pll
 	.refclk(CLK_50M),
 	.rst(1'b0),
 	.outclk_0(clk_sys),
-	.outclk_1(clk_pll1_unused),  // was clk_t11 (20 MHz); collapsed into clk_sys
+	.outclk_1(clk_vid64),        // was clk_t11 (20 MHz) then unused; SCANDOUBLER PATCH: now the 64 MHz video clock
 	.outclk_2(SDRAM_CLK),   // clean phase-controlled SDRAM clock (was fabric ~clk in the controller)
 	.locked(pll_locked)
 );
@@ -370,8 +370,10 @@ sys2_video_timing video_timing
 	.vblank_irq(vblank_irq)
 );
 
-assign CLK_VIDEO = clk_sys;
-assign CE_PIXEL  = ce_pix;
+// SCANDOUBLER PATCH: CLK_VIDEO is now the 64 MHz clock so sys/video_mixer's scandoubler has the
+// four clocks per input pixel it requires (see its CLK_VIDEO port comment). CE_PIXEL is driven at
+// the bottom of the video output stage (search "Scandoubler").
+assign CLK_VIDEO = clk_vid64;
 // VGA_DE / VGA_HS / VGA_VS / VGA_R / VGA_G / VGA_B are driven by the video output stage further
 // down (search "Video output stage").
 
@@ -423,8 +425,8 @@ sys2_analog_sync_shift #(
 
 // At shift 0 the generator already reproduces the renderer's own sync exactly; muxing back to it
 // anyway keeps a default build provably untouched even if the renderer's pipeline depth changes.
-assign VGA_HS = (|status[57:52]) ? hs_shifted : video_hsync;
-assign VGA_VS = (|status[63:58]) ? vs_shifted : video_vsync;
+wire nat_hs = (|status[57:52]) ? hs_shifted : video_hsync;   // SCANDOUBLER PATCH: was assign VGA_HS
+wire nat_vs = (|status[63:58]) ? vs_shifted : video_vsync;   // SCANDOUBLER PATCH: was assign VGA_VS
 
 // ---- CRT H-Position -------------------------------------------------------------------------
 // video_de is the only raster input it needs: it derives its own vertical gate from whether a
@@ -453,11 +455,90 @@ sys2_analog_hpos #(.AW(10)) analog_hpos     // 1024 per bank >= the 640-pixel ho
 
 // sys_top gates the analog DAC with VGA_DE (it feeds the scanline/OSD chain 0 outside it), so the
 // repositioned picture and its DE window have to travel together.
-wire vga_de_in = hpos_active ? hpos_de : video_de;
+wire       nat_de = hpos_active ? hpos_de : video_de;      // SCANDOUBLER PATCH: was vga_de_in
+wire [7:0] nat_r  = hpos_active ? hpos_r  : video_red;    // SCANDOUBLER PATCH: was assign VGA_R
+wire [7:0] nat_g  = hpos_active ? hpos_g  : video_green;  // SCANDOUBLER PATCH: was assign VGA_G
+wire [7:0] nat_b  = hpos_active ? hpos_b  : video_blue;   // SCANDOUBLER PATCH: was assign VGA_B
 
-assign VGA_R = hpos_active ? hpos_r : video_red;
-assign VGA_G = hpos_active ? hpos_g : video_green;
-assign VGA_B = hpos_active ? hpos_b : video_blue;
+//------------------------------------------------------------------------------------------------
+// Scandoubler (SCANDOUBLER PATCH -- experimental)
+//
+// Atari System 2 is a 24 kHz medium-res board: too fast for a 15 kHz TV, too slow for a VGA CRT
+// (>=31 kHz).  Doubling the line rate to 48 kHz puts it inside an ordinary multisync monitor's
+// range.  sys/video_mixer instantiates sys/scandoubler, which is rate-agnostic -- it MEASURES the
+// incoming pixel period and replays each buffered line twice -- so 24->48 kHz needs no new logic,
+// only the clocking below.
+//
+// WHY A NEW CLOCK: scandoubler.v places its internal enables at 1/4, 1/2 and 3/4 of the measured
+// input pixel period, and Hq2x sits in the datapath even when disabled (disable_hq2x), clocked by
+// those quarter-period enables.  With the old CLK_VIDEO = clk_sys = 32 MHz and a 16 MHz pixel
+// clock there are only TWO clocks per pixel, so pixsz4 rounds to 0 and the chain starves.  The
+// PLL's outclk_1 (idle since the clk_t11 collapse) is retuned 20 -> 64 MHz to give the required
+// four.  clk_sys is untouched: the renderer, main bus, sound and SDRAM all still run at 32 MHz.
+//
+// ce_pix is a 32 MHz-domain enable, so it is edge-detected into the 64 MHz domain.  Both clocks
+// come from the same PLL and 64 is an exact multiple of 32, so this is a synchronous handoff, not
+// a CDC -- derive_pll_clocks in atarisys2.sdc already relates them.
+//
+// BLANK ALIGNMENT: the mixer wants HBlank/VBlank, not DE.  hblank/vblank come straight off the
+// raster counters while the renderer's RGB is PIPE=4 pixels behind them (the same depth
+// sys2_analog_sync_shift compensates), so they are delayed by four ce_pix to line up with
+// video_red/green/blue and video_hsync.
+//
+// The native path above is left completely intact and is still selected whenever the option is
+// off, so a default build keeps the existing analog H/V-shift and H-Position behaviour.  Those
+// analog fine-alignment controls do NOT apply on the scandoubled path in this first cut -- they
+// shift RGB and sync without producing matching blanks, which the mixer would need.
+//------------------------------------------------------------------------------------------------
+reg [3:0] hb_pipe, vb_pipe;
+always @(posedge clk_sys) if (ce_pix) begin
+	hb_pipe <= {hb_pipe[2:0], hblank};
+	vb_pipe <= {vb_pipe[2:0], vblank};
+end
+
+reg ce_pix_s1, ce_pix_s2;
+always @(posedge clk_vid64) begin
+	ce_pix_s1 <= ce_pix;
+	ce_pix_s2 <= ce_pix_s1;
+end
+wire ce_pix_64 = ce_pix_s1 & ~ce_pix_s2;   // one 64 MHz-wide pulse per input pixel
+
+wire [7:0] sd_r, sd_g, sd_b;
+wire       sd_hs, sd_vs, sd_de, sd_ce;
+
+video_mixer #(.LINE_LENGTH(768), .HALF_DEPTH(0), .GAMMA(0)) video_mixer
+(
+	.CLK_VIDEO  (clk_vid64),
+	.CE_PIXEL   (sd_ce),
+	.ce_pix     (ce_pix_64),
+	.scandoubler(forced_scandoubler),
+	.hq2x       (1'b0),
+	.gamma_bus  (),
+	.R          (video_red),
+	.G          (video_green),
+	.B          (video_blue),
+	.HSync      (video_hsync),
+	.VSync      (video_vsync),
+	.HBlank     (hb_pipe[3]),
+	.VBlank     (vb_pipe[3]),
+	.HDMI_FREEZE(1'b0),
+	.freeze_sync(),
+	.VGA_R      (sd_r),
+	.VGA_G      (sd_g),
+	.VGA_B      (sd_b),
+	.VGA_VS     (sd_vs),
+	.VGA_HS     (sd_hs),
+	.VGA_DE     (sd_de)
+);
+
+assign VGA_R    = forced_scandoubler ? sd_r  : nat_r;
+assign VGA_G    = forced_scandoubler ? sd_g  : nat_g;
+assign VGA_B    = forced_scandoubler ? sd_b  : nat_b;
+assign VGA_HS   = forced_scandoubler ? sd_hs : nat_hs;
+assign VGA_VS   = forced_scandoubler ? sd_vs : nat_vs;
+assign CE_PIXEL = forced_scandoubler ? sd_ce : ce_pix_64;
+
+wire vga_de_in  = forced_scandoubler ? sd_de : nat_de;
 
 // ---- Scale ------------------------------------------------------------------------------------
 // video_freak SCALE codes: 0 normal, 1 V-integer, 2 HV-integer narrower, 3 HV-integer wider,
